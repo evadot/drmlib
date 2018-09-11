@@ -44,7 +44,6 @@ __FBSDID("$FreeBSD$");
 #include <arm/nvidia/drmlib/tegra_drm.h>
 
 #include <sys/vmem.h>
-#include <sys/vmem.h>
 #include <vm/vm.h>
 #include <vm/vm_pageout.h>
 #include <vm/vm_pager.h>
@@ -136,6 +135,7 @@ tegra_bo_alloc(struct drm_device *drm, struct tegra_bo *bo)
 
 	size = round_page(bo->gem_obj.size);
 	bo->npages = atop(size);
+	bo->size = round_page(size);
 	bo->m = malloc(sizeof(vm_page_t *) * bo->npages, DRM_MEM_DRIVER,
 	    M_WAITOK | M_ZERO);
 
@@ -162,13 +162,8 @@ tegra_bo_alloc(struct drm_device *drm, struct tegra_bo *bo)
 		m->oflags &= ~VPO_UNMANAGED;
 		m->flags |= PG_FICTITIOUS;
 	}
-	
+
 	bo->pbase = VM_PAGE_TO_PHYS(bo->m[0]);
-	/* XXX Only necessary for frame buffer and cursor object */
-	if (vmem_alloc(kmem_arena, size, M_WAITOK | M_BESTFIT, &bo->vbase))
-		return (ENOMEM);
-	pmap_qenter(bo->vbase, bo->m, bo->npages);
-	
 	return (0);
 }
 
@@ -251,7 +246,7 @@ tegra_bo_dumb_create(struct drm_file *file, struct drm_device *drm_dev,
 	return (rv);
 }
 
-static int 
+static int
 tegra_bo_fault(struct vm_area_struct *dummy, struct vm_fault *vmf)
 {
 
@@ -274,7 +269,7 @@ tegra_bo_fault(struct vm_area_struct *dummy, struct vm_fault *vmf)
 	pidx = OFF_TO_IDX(vmf->address - vma->vm_start);
 	if (pidx >= bo->npages)
 		return (VM_FAULT_SIGBUS);
-		
+
 	VM_OBJECT_WLOCK(obj);
 	for (i = 0; i < bo->npages; i++) {
 		page = bo->m[i];
@@ -286,13 +281,13 @@ tegra_bo_fault(struct vm_area_struct *dummy, struct vm_fault *vmf)
 		page->valid = VM_PAGE_BITS_ALL;
 	}
 	VM_OBJECT_WUNLOCK(obj);
-	
+
 	vma->vm_pfn_first = 0;
 	vma->vm_pfn_count =  bo->npages;
 printf("%s: pidx: %llu, start: 0x%08X, addr: 0x%08lX\n", __func__, pidx, vma->vm_start, vmf->address);
 
 	return (VM_FAULT_NOPAGE);
-	
+
 fail_unlock:
 	VM_OBJECT_WUNLOCK(obj);
 	printf("%s: insert failed\n", __func__);
@@ -310,7 +305,7 @@ int
 tegra_bo_mmap(struct drm_gem_object *gem_obj, struct vm_area_struct *vma)
 {
 	struct tegra_bo *bo;
-	
+
 	bo = container_of(gem_obj, struct tegra_bo, gem_obj);
 	if (bo->pbase == 0)
 		return (0);

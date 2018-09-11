@@ -36,8 +36,8 @@ struct tegra_bo {
 	vm_paddr_t		pbase;
 	vm_offset_t		vbase;
 	size_t			npages;
+	size_t			size;		/* Rounded to page */
 	vm_page_t 		*m;
-	vm_object_t		cdev_pager;
 };
 
 struct tegra_plane {
@@ -49,6 +49,7 @@ struct tegra_fb {
 	struct drm_framebuffer	drm_fb;
 	struct drm_fb_helper	fb_helper;
 	struct tegra_bo		**planes;	/* Attached planes */
+	vm_offset_t		*planes_vbase;
 	int			nplanes;
 
 	/* Surface and display geometry */
@@ -63,8 +64,6 @@ struct tegra_crtc {
 	struct drm_crtc 	drm_crtc;
 	device_t		dev;
 	int			nvidia_head;
-	vm_paddr_t		cursor_pbase;	/* Cursor buffer */
-	vm_offset_t		cursor_vbase;
 };
 
 struct tegra_drm_encoder {

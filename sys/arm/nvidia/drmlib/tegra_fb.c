@@ -32,8 +32,11 @@ __FBSDID("$FreeBSD$");
 #include <sys/bus.h>
 #include <sys/kernel.h>
 #include <sys/malloc.h>
+#include <sys/vmem.h>
 
 #include <machine/bus.h>
+
+#include <vm/vm.h>
 
 #include <dev/extres/clk/clk.h>
 #include <drm/drmP.h>
@@ -53,12 +56,16 @@ fb_destroy(struct drm_framebuffer *drm_fb)
 	fb = container_of(drm_fb, struct tegra_fb, drm_fb);
 	for (i = 0; i < fb->nplanes; i++) {
 		bo = fb->planes[i];
-		if (bo != NULL)
+		if (bo != NULL) {
+			pmap_qremove(fb->planes_vbase[i], bo->npages);
+			vmem_free(kmem_arena, fb->planes_vbase[i], bo->size);
 			drm_gem_object_unreference_unlocked(&bo->gem_obj);
+		}
 	}
 
 	drm_framebuffer_cleanup(drm_fb);
 	free(fb->planes, DRM_MEM_DRIVER);
+	free(fb->planes_vbase, DRM_MEM_DRIVER);
 }
 
 static int
@@ -99,11 +106,20 @@ fb_alloc(struct drm_device *drm, const struct drm_mode_fb_cmd2 *mode_cmd,
 	fb = malloc(sizeof(*fb), DRM_MEM_DRIVER, M_WAITOK | M_ZERO);
 	fb->planes = malloc(num_planes * sizeof(*fb->planes), DRM_MEM_DRIVER,
 	    M_WAITOK | M_ZERO);
+	fb->planes_vbase = malloc(num_planes * sizeof(*fb->planes_vbase),
+	    DRM_MEM_DRIVER,  M_WAITOK | M_ZERO);
 	fb->nplanes = num_planes;
 
 	drm_helper_mode_fill_fb_struct(drm, &fb->drm_fb, mode_cmd);
-	for (i = 0; i < fb->nplanes; i++)
+	for (i = 0; i < fb->nplanes; i++) {
 		fb->planes[i] = planes[i];
+		rv = vmem_alloc(kmem_arena, planes[i]->size,
+		    M_WAITOK | M_BESTFIT, &fb->planes_vbase[i]);
+		if (rv != 0)
+			return (ENOMEM);
+		pmap_qenter(fb->planes_vbase[i], planes[i]->m,
+		    planes[i]->npages);
+	}
 	rv = drm_framebuffer_init(drm, &fb->drm_fb, &fb_funcs);
 	if (rv < 0) {
 		device_printf(drm->dev,
@@ -171,10 +187,10 @@ tegra_fb_probe(struct drm_fb_helper *helper,
 
 	helper->fb = &fb->drm_fb;
 	helper->fbdev = info;
-	
+
 	/* Fill FB info */
-	info->fb_vbase = bo->vbase;
-	info->fb_pbase = bo->pbase;
+	info->fb_vbase = fb->planes_vbase[0];
+	info->fb_pbase = fb->planes[0]->pbase;
 	info->fb_size = size;
 	info->fb_bpp = sizes->surface_bpp;
 	drm_fb_helper_fill_fix(info, fb->drm_fb.pitches[0],

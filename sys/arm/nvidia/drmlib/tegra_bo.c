@@ -32,6 +32,14 @@ __FBSDID("$FreeBSD$");
 #include <sys/bus.h>
 #include <sys/kernel.h>
 #include <sys/malloc.h>
+#include <sys/rwlock.h>
+#include <sys/vmem.h>
+
+#include <vm/vm.h>
+#include <vm/vm_object.h>
+#include <vm/vm_page.h>
+#include <vm/vm_pageout.h>
+#include <vm/vm_pager.h>
 
 #include <machine/bus.h>
 
@@ -42,12 +50,6 @@ __FBSDID("$FreeBSD$");
 #include <drm/drm_gem.h>
 
 #include <arm/nvidia/drmlib/tegra_drm.h>
-
-#include <sys/vmem.h>
-#include <vm/vm.h>
-#include <vm/vm_pageout.h>
-#include <vm/vm_pager.h>
-
 
 static void
 tegra_bo_destruct(struct tegra_bo *bo)

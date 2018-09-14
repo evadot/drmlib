@@ -42,15 +42,16 @@ __FBSDID("$FreeBSD$");
 #include <dev/extres/clk/clk.h>
 #include <dev/extres/hwreset/hwreset.h>
 #include <dev/extres/regulator/regulator.h>
+#include <dev/gpio/gpiobusvar.h>
+#include <dev/ofw/ofw_bus.h>
+#include <dev/ofw/ofw_bus_subr.h>
+
 #include <drm/drmP.h>
+#include <drm/drm_atomic_helper.h>
 #include <drm/drm_crtc.h>
 #include <drm/drm_crtc_helper.h>
 #include <drm/drm_fb_helper.h>
 #include <drm/drm_gem.h>
-
-#include <dev/gpio/gpiobusvar.h>
-#include <dev/ofw/ofw_bus.h>
-#include <dev/ofw/ofw_bus_subr.h>
 
 #include <arm/nvidia/drmlib/tegra_drm.h>
 #include <arm/nvidia/drmlib/tegra_hdmi_reg.h>
@@ -215,6 +216,7 @@ static struct ofw_compat_data compat_data[] = {
 static int
 hdmi_setup_clock(struct tegra_drm_encoder *output, clk_t clk, uint64_t pclk)
 {
+printf("%s: Enter\n", __func__);
 	struct hdmi_softc *sc;
 	uint64_t freq;
 	int rv;
@@ -576,6 +578,7 @@ audio_enable(struct hdmi_softc *sc) {
 static void
 hda_intr(struct hdmi_softc *sc)
 {
+printf("%s: Enter\n", __func__);
 	uint32_t val;
 	int rv;
 
@@ -607,6 +610,7 @@ hda_intr(struct hdmi_softc *sc)
 static void
 tmds_init(struct hdmi_softc *sc, const struct tmds_config *tmds)
 {
+printf("%s: Enter\n", __func__);
 
 	WR4(sc, HDMI_NV_PDISP_SOR_PLL0, tmds->pll0);
 	WR4(sc, HDMI_NV_PDISP_SOR_PLL1, tmds->pll1);
@@ -619,6 +623,7 @@ tmds_init(struct hdmi_softc *sc, const struct tmds_config *tmds)
 static int
 hdmi_sor_start(struct hdmi_softc *sc, struct drm_display_mode *mode)
 {
+printf("%s: Enter\n", __func__);
 	int i;
 	uint32_t val;
 
@@ -677,6 +682,7 @@ hdmi_sor_start(struct hdmi_softc *sc, struct drm_display_mode *mode)
 static int
 hdmi_disable(struct hdmi_softc *sc)
 {
+printf("%s: Enter\n", __func__);
 	struct tegra_crtc *crtc;
 	device_t dc;
 	uint32_t val;
@@ -707,6 +713,7 @@ hdmi_disable(struct hdmi_softc *sc)
 static int
 hdmi_enable(struct hdmi_softc *sc)
 {
+printf("%s: Enter\n", __func__);
 	uint64_t freq;
 	struct drm_display_mode *mode;
 	struct tegra_crtc *crtc;
@@ -845,8 +852,84 @@ hdmi_enable(struct hdmi_softc *sc)
  *	DRM Interface.
  *
  */
+ static enum drm_connector_status
+hdmi_connector_detect(struct drm_connector *connector, bool force)
+{
+	struct tegra_drm_encoder *output;
+	bool active;
+	int rv;
+
+	output = container_of(connector, struct tegra_drm_encoder,
+	     connector);
+	if (output->gpio_hpd == NULL) {
+		return ((output->panel != NULL) ?
+		    connector_status_connected:
+		    connector_status_disconnected);
+	}
+
+	rv = gpio_pin_is_active(output->gpio_hpd, &active);
+	if (rv  != 0) {
+		device_printf(output->dev, " GPIO read failed: %d\n", rv);
+		return (connector_status_unknown);
+	}
+
+	return (active ?
+	    connector_status_connected : connector_status_disconnected);
+}
+
+static void
+hdmi_connector_destroy(struct drm_connector *connector)
+{
+
+	drm_connector_unregister(connector);
+	drm_connector_cleanup(connector);
+}
+
+
+static const struct drm_connector_funcs hdmi_connector_funcs = {
+
+	.reset = drm_atomic_helper_connector_reset,
+	.detect = hdmi_connector_detect,
+	.fill_modes = drm_helper_probe_single_connector_modes,
+	.destroy = hdmi_connector_destroy,
+	.atomic_duplicate_state = drm_atomic_helper_connector_duplicate_state,
+	.atomic_destroy_state = drm_atomic_helper_connector_destroy_state,
+};
+
+static int
+hdmi_connector_helper_get_modes(struct drm_connector *connector)
+{
+	struct tegra_drm_encoder *output;
+	struct edid *edid = NULL;
+	int rv;
+
+	output = container_of(connector, struct tegra_drm_encoder,
+	     connector);
+
+	/* Panel is first */
+	if (output->panel != NULL) {
+		/* XXX panel parsing */
+		return (0);
+	}
+
+	/* static EDID is second*/
+	edid = output->edid;
+
+	/* EDID from monitor is last */
+	if (edid == NULL)
+		edid = drm_get_edid(connector, output->ddc);
+
+	if (edid == NULL)
+		return (0);
+
+	/* Process EDID */
+	drm_connector_update_edid_property(connector, edid);
+	rv = drm_add_edid_modes(connector, edid);
+	return (rv);
+}
+
 static enum drm_mode_status
-hdmi_connector_mode_valid(struct drm_connector *connector,
+hdmi_connector_helper_mode_valid(struct drm_connector *connector,
     struct drm_display_mode *mode)
 {
 	struct tegra_drm_encoder *output;
@@ -867,18 +950,9 @@ hdmi_connector_mode_valid(struct drm_connector *connector,
 	return (MODE_OK);
 }
 
-
 static const struct drm_connector_helper_funcs hdmi_connector_helper_funcs = {
-	.get_modes = tegra_drm_connector_get_modes,
-	.mode_valid = hdmi_connector_mode_valid,
-	.best_encoder = tegra_drm_connector_best_encoder,
-};
-
-static const struct drm_connector_funcs hdmi_connector_funcs = {
-	.dpms = drm_helper_connector_dpms,
-	.detect = tegra_drm_connector_detect,
-	.fill_modes = drm_helper_probe_single_connector_modes,
-	.destroy = drm_connector_cleanup,
+	.get_modes = hdmi_connector_helper_get_modes,
+	.mode_valid = hdmi_connector_helper_mode_valid,
 };
 
 static const struct drm_encoder_funcs hdmi_encoder_funcs = {
@@ -886,38 +960,7 @@ static const struct drm_encoder_funcs hdmi_encoder_funcs = {
 };
 
 static void
-hdmi_encoder_dpms(struct drm_encoder *encoder, int mode)
-{
-
-	/* Empty function. */
-}
-
-static bool
-hdmi_encoder_mode_fixup(struct drm_encoder *encoder,
-    const struct drm_display_mode *mode,
-    struct drm_display_mode *adjusted)
-{
-
-	return (true);
-}
-
-static void
-hdmi_encoder_prepare(struct drm_encoder *encoder)
-{
-
-	/* Empty function. */
-}
-
-static void
-hdmi_encoder_commit(struct drm_encoder *encoder)
-{
-
-	/* Empty function. */
-}
-
-static void
-hdmi_encoder_mode_set(struct drm_encoder *encoder,
-    struct drm_display_mode *mode, struct drm_display_mode *adjusted)
+hdmi_encoder_enable(struct drm_encoder *encoder)
 {
 	struct tegra_drm_encoder *output;
 	struct hdmi_softc *sc;
@@ -946,14 +989,19 @@ hdmi_encoder_disable(struct drm_encoder *encoder)
 	if (rv != 0)
 		device_printf(sc->dev, "Cannot disable HDMI port\n");
 }
+static int
+hdmi_encoder_atomic_check(struct drm_encoder *encoder,
+    struct drm_crtc_state *crtc_state, struct drm_connector_state *conn_state)
+{
+
+	/* TODO: Verify validity of hdmi (or derived) clock(s) */
+	return (0);
+}
 
 static const struct drm_encoder_helper_funcs hdmi_encoder_helper_funcs = {
-	.dpms = hdmi_encoder_dpms,
-	.mode_fixup = hdmi_encoder_mode_fixup,
-	.prepare = hdmi_encoder_prepare,
-	.commit = hdmi_encoder_commit,
-	.mode_set = hdmi_encoder_mode_set,
 	.disable = hdmi_encoder_disable,
+	.enable = hdmi_encoder_enable,
+	.atomic_check = hdmi_encoder_atomic_check,
 };
 
 /* -------------------------------------------------------------------

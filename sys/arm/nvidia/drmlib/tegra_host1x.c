@@ -45,14 +45,16 @@ __FBSDID("$FreeBSD$");
 
 #include <dev/extres/clk/clk.h>
 #include <dev/extres/hwreset/hwreset.h>
+#include <dev/fdt/simplebus.h>
+#include <dev/ofw/ofw_bus.h>
+#include <dev/ofw/ofw_bus_subr.h>
+
 #include <drm/drmP.h>
+#include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_crtc_helper.h>
 #include <drm/drm_fb_helper.h>
 #include <drm/drm_gem.h>
-#include <dev/fdt/simplebus.h>
-#include <dev/ofw/ofw_bus.h>
-#include <dev/ofw/ofw_bus_subr.h>
 
 #include <linux/device.h>
 
@@ -79,9 +81,9 @@ static struct ofw_compat_data compat_data[] = {
 };
 
 #define DRIVER_NAME "tegra"
-#define DRIVER_DESC "NVIDIA Tegra TK1"
-#define DRIVER_DATE "20151101"
-#define DRIVER_MAJOR 0
+#define DRIVER_DESC "NVIDIA Tegra"
+#define DRIVER_DATE "20180911"
+#define DRIVER_MAJOR 1
 #define DRIVER_MINOR 0
 #define DRIVER_PATCHLEVEL 0
 
@@ -129,11 +131,29 @@ host1x_output_poll_changed(struct drm_device *drm_dev)
 		drm_fb_helper_hotplug_event(&drm->fb->fb_helper);
 }
 
+static int
+host1x_atomic_check(struct drm_device *drm, struct drm_atomic_state *state)
+{
+	int rv;
+
+	rv = drm_atomic_helper_check(drm, state);
+	if (rv != 0 )
+		return (rv);
+
+	return (0);
+}
+
 static const struct drm_mode_config_funcs mode_config_funcs = {
 	.fb_create = tegra_drm_fb_create,
 	.output_poll_changed = host1x_output_poll_changed,
+	.atomic_check = host1x_atomic_check,
+	.atomic_commit = drm_atomic_helper_commit,
 };
 
+
+static const struct drm_mode_config_helper_funcs mode_config_helpers = {
+	.atomic_commit_tail = drm_atomic_helper_commit_tail_rpm,
+};
 
 static int
 host1x_drm_init(struct host1x_softc *sc)
@@ -202,7 +222,7 @@ host1x_drm_load(struct drm_device *drm_dev, unsigned long flags)
 {
 	struct host1x_softc *sc;
 	int rv;
-	
+
 	sc = device_get_softc(dev_get_drvdata(drm_dev->dev));
 
 	drm_mode_config_init(drm_dev);
@@ -213,12 +233,12 @@ host1x_drm_load(struct drm_device *drm_dev, unsigned long flags)
 	drm_dev->mode_config.allow_fb_modifiers = true;
 	drm_dev->mode_config.normalize_zpos = true;
 	drm_dev->mode_config.funcs = &mode_config_funcs;
-//	drm_dev->mode_config.helper_private = &mode_config_helpers;
+	drm_dev->mode_config.helper_private = &mode_config_helpers;
 
 	rv = tegra_drm_fb_preinit(drm_dev);
 	if (rv != 0)
 		goto fail_host1x;
-	
+
 	rv = host1x_drm_init(sc);
 	if (rv != 0)
 		goto fail_host1x;
@@ -268,16 +288,7 @@ host1x_drm_unload(struct drm_device *drm_dev)
 static int
 host1x_drm_open(struct drm_device *drm_dev, struct drm_file *filp)
 {
-//	struct tegra_drm_file *fpriv;
 
-//	fpriv = kzalloc(sizeof(*fpriv), GFP_KERNEL);
-//	if (!fpriv)
-//		return -ENOMEM;
-
-//	idr_init(&fpriv->contexts);
-//	mutex_init(&fpriv->lock);
-//	filp->driver_priv = fpriv;
-	
 	return (0);
 }
 
@@ -294,10 +305,10 @@ static void
 host1x_drm_lastclose(struct drm_device *drm_dev)
 {
 
-	struct tegra_drm *drm;
-
-	drm = container_of(drm_dev, struct tegra_drm, drm_dev);
-//	if (drm->>fb  != NULL)
+//	struct tegra_drm *drm;
+//
+//	drm = container_of(drm_dev, struct tegra_drm, drm_dev);
+//	if (drm->fb  != NULL)
 //		drm_fb_helper_restore_fbdev_mode(&drm->fb->fb_helper);
 }
 
@@ -306,19 +317,230 @@ host1x_drm_mmap(struct file *file, struct vm_area_struct *vma)
 {
 	int rv;
 
-printf("%s: Enter\n", __func__);
 	rv = drm_gem_mmap(file, vma);
-printf("%s: drm_gem_mmap(): %d\n", __func__, rv);
 	if (rv < 0)
 		return (rv);
 
 	rv = tegra_bo_mmap(vma->vm_private_data, vma);
-printf("%s: leave\n", __func__);
+	return (rv);
+}
+
+/* Tegra specific IOCTLs */
+/*
+static int
+tegra_ioctl_gem_create(struct drm_device *drm, void *data,
+    struct drm_file *file)
+{
+	struct drm_tegra_gem_create *args;
+	struct tegra_bo *bo;
+	int rv;
+
+	args = data;
+	rv = tegra_bo_create_with_handle(file, drm, args->size, args->flags,
+	    &args->handle, &bo);
+
 	return (rv);
 }
 
 
+static int
+tegra_ioctl_gem_mmap(struct drm_device *drm, void *data, struct drm_file *file)
+{
+	struct drm_tegra_gem_mmap *args;
+	struct drm_gem_object *gem;
+	struct tegra_bo *bo;
+	int rv;
+
+	args = data;
+	gem = drm_gem_object_lookup(file, args->handle);
+	if (!gem)
+		return (-EINVAL);
+
+	bo = to_tegra_bo(gem);
+
+	args->offset = drm_vma_node_offset_addr(&bo->gem.vma_node);
+
+	drm_gem_object_put_unlocked(gem);
+
+	return 0;
+}
+
+static int tegra_gem_set_tiling(struct drm_device *drm, void *data,
+				struct drm_file *file)
+{
+	struct drm_tegra_gem_set_tiling *args = data;
+	enum tegra_bo_tiling_mode mode;
+	struct drm_gem_object *gem;
+	unsigned long value = 0;
+	struct tegra_bo *bo;
+
+	switch (args->mode) {
+	case DRM_TEGRA_GEM_TILING_MODE_PITCH:
+		mode = TEGRA_BO_TILING_MODE_PITCH;
+
+		if (args->value != 0)
+			return -EINVAL;
+
+		break;
+
+	case DRM_TEGRA_GEM_TILING_MODE_TILED:
+		mode = TEGRA_BO_TILING_MODE_TILED;
+
+		if (args->value != 0)
+			return -EINVAL;
+
+		break;
+
+	case DRM_TEGRA_GEM_TILING_MODE_BLOCK:
+		mode = TEGRA_BO_TILING_MODE_BLOCK;
+
+		if (args->value > 5)
+			return -EINVAL;
+
+		value = args->value;
+		break;
+
+	default:
+		return -EINVAL;
+	}
+
+	gem = drm_gem_object_lookup(file, args->handle);
+	if (!gem)
+		return -ENOENT;
+
+	bo = to_tegra_bo(gem);
+
+	bo->tiling.mode = mode;
+	bo->tiling.value = value;
+
+	drm_gem_object_put_unlocked(gem);
+
+	return 0;
+}
+
+static int tegra_gem_get_tiling(struct drm_device *drm, void *data,
+				struct drm_file *file)
+{
+	struct drm_tegra_gem_get_tiling *args = data;
+	struct drm_gem_object *gem;
+	struct tegra_bo *bo;
+	int err = 0;
+
+	gem = drm_gem_object_lookup(file, args->handle);
+	if (!gem)
+		return -ENOENT;
+
+	bo = to_tegra_bo(gem);
+
+	switch (bo->tiling.mode) {
+	case TEGRA_BO_TILING_MODE_PITCH:
+		args->mode = DRM_TEGRA_GEM_TILING_MODE_PITCH;
+		args->value = 0;
+		break;
+
+	case TEGRA_BO_TILING_MODE_TILED:
+		args->mode = DRM_TEGRA_GEM_TILING_MODE_TILED;
+		args->value = 0;
+		break;
+
+	case TEGRA_BO_TILING_MODE_BLOCK:
+		args->mode = DRM_TEGRA_GEM_TILING_MODE_BLOCK;
+		args->value = bo->tiling.value;
+		break;
+
+	default:
+		err = -EINVAL;
+		break;
+	}
+
+	drm_gem_object_put_unlocked(gem);
+
+	return err;
+}
+
+static int tegra_gem_set_flags(struct drm_device *drm, void *data,
+			       struct drm_file *file)
+{
+	struct drm_tegra_gem_set_flags *args = data;
+	struct drm_gem_object *gem;
+	struct tegra_bo *bo;
+
+	if (args->flags & ~DRM_TEGRA_GEM_FLAGS)
+		return -EINVAL;
+
+	gem = drm_gem_object_lookup(file, args->handle);
+	if (!gem)
+		return -ENOENT;
+
+	bo = to_tegra_bo(gem);
+	bo->flags = 0;
+
+	if (args->flags & DRM_TEGRA_GEM_BOTTOM_UP)
+		bo->flags |= TEGRA_BO_BOTTOM_UP;
+
+	drm_gem_object_put_unlocked(gem);
+
+	return 0;
+}
+
+static int tegra_gem_get_flags(struct drm_device *drm, void *data,
+			       struct drm_file *file)
+{
+	struct drm_tegra_gem_get_flags *args = data;
+	struct drm_gem_object *gem;
+	struct tegra_bo *bo;
+
+	gem = drm_gem_object_lookup(file, args->handle);
+	if (!gem)
+		return -ENOENT;
+
+	bo = to_tegra_bo(gem);
+	args->flags = 0;
+
+	if (bo->flags & TEGRA_BO_BOTTOM_UP)
+		args->flags |= DRM_TEGRA_GEM_BOTTOM_UP;
+
+	drm_gem_object_put_unlocked(gem);
+
+	return 0;
+}
+
+*/
+
+
 static struct drm_ioctl_desc host1x_drm_ioctls[] = {
+
+//	DRM_IOCTL_DEF_DRV(TEGRA_GEM_CREATE, tegra_ioctl_gem_create,
+//			  DRM_UNLOCKED | DRM_RENDER_ALLOW),
+//	DRM_IOCTL_DEF_DRV(TEGRA_GEM_MMAP, tegra_gem_mmap,
+//			  DRM_UNLOCKED | DRM_RENDER_ALLOW),
+//	DRM_IOCTL_DEF_DRV(TEGRA_GEM_SET_TILING, tegra_gem_set_tiling,
+//			  DRM_UNLOCKED | DRM_RENDER_ALLOW),
+//	DRM_IOCTL_DEF_DRV(TEGRA_GEM_GET_TILING, tegra_gem_get_tiling,
+//			  DRM_UNLOCKED | DRM_RENDER_ALLOW),
+//	DRM_IOCTL_DEF_DRV(TEGRA_GEM_SET_FLAGS, tegra_gem_set_flags,
+//			  DRM_UNLOCKED | DRM_RENDER_ALLOW),
+//	DRM_IOCTL_DEF_DRV(TEGRA_GEM_GET_FLAGS, tegra_gem_get_flags,
+//			  DRM_UNLOCKED | DRM_RENDER_ALLOW),
+#if 0
+	DRM_IOCTL_DEF_DRV(TEGRA_SYNCPT_READ, tegra_syncpt_read,
+			  DRM_UNLOCKED | DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(TEGRA_SYNCPT_INCR, tegra_syncpt_incr,
+			  DRM_UNLOCKED | DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(TEGRA_SYNCPT_WAIT, tegra_syncpt_wait,
+			  DRM_UNLOCKED | DRM_RENDER_ALLOW),
+
+	DRM_IOCTL_DEF_DRV(TEGRA_OPEN_CHANNEL, tegra_open_channel,
+			  DRM_UNLOCKED | DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(TEGRA_CLOSE_CHANNEL, tegra_close_channel,
+			  DRM_UNLOCKED | DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(TEGRA_GET_SYNCPT, tegra_get_syncpt,
+			  DRM_UNLOCKED | DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(TEGRA_SUBMIT, tegra_submit,
+			  DRM_UNLOCKED | DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(TEGRA_GET_SYNCPT_BASE, tegra_get_syncpt_base,
+			  DRM_UNLOCKED | DRM_RENDER_ALLOW),
+#endif
 };
 
 static const struct file_operations host1x_drm_fops = {
@@ -334,22 +556,16 @@ static const struct file_operations host1x_drm_fops = {
 };
 
 struct drm_driver tegra_drm_driver = {
-	.driver_features = DRIVER_MODESET | DRIVER_GEM | DRIVER_PRIME,
-//    DRIVER_ATOMIC | DRIVER_RENDER,
+	.driver_features = DRIVER_MODESET | DRIVER_GEM | DRIVER_PRIME |
+	    DRIVER_ATOMIC | DRIVER_RENDER,
 	.load = host1x_drm_load,
 	.unload = host1x_drm_unload,
 	.open = host1x_drm_open,
 	.preclose = host1x_drm_preclose,
 	.lastclose = host1x_drm_lastclose,
 
-	/* Fields filled by tegra_bo_driver_register()
+	/* GEM fields are filled by tegra_bo_driver_register() */
 
-	.gem_free_object
-	.gem_pager_ops
-	.dumb_create
-	.dumb_map_offset
-	.dumb_destroy
-	*/
 	.ioctls = host1x_drm_ioctls,
 	.num_ioctls = nitems(host1x_drm_ioctls),
 	.fops = &host1x_drm_fops,
@@ -374,13 +590,13 @@ host1x_irq_hook(void *arg)
 {
 	struct host1x_softc *sc;
 	int rv;
-	
+
 	sc = arg;
 	config_intrhook_disestablish(&sc->irq_hook);
 
 	tegra_bo_driver_register(&tegra_drm_driver);
 
-	/* Allocate linux device for DRM driver */ 
+	/* Allocate linux device for DRM driver */
 	sc->lindev = malloc(sizeof(struct device), DRM_MEM_DRIVER,
 	    M_WAITOK | M_ZERO);
 	sc->lindev->parent = &linux_root_device;
@@ -403,7 +619,7 @@ host1x_irq_hook(void *arg)
 		return;
 	}
 	sc->tegra_drm->drm_dev.dev_private = &sc->tegra_drm;
-	
+
 	sc->drm_inited = 1;
 }
 

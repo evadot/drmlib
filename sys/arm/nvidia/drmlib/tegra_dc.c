@@ -42,6 +42,8 @@ __FBSDID("$FreeBSD$");
 #include <dev/extres/clk/clk.h>
 #include <dev/extres/hwreset/hwreset.h>
 #include <drm/drmP.h>
+#include <drm/drm_atomic.h>
+#include <drm/drm_atomic_helper.h>
 #include <drm/drm_crtc_helper.h>
 #include <drm/drm_fb_helper.h>
 #include <drm/drm_fixed.h>
@@ -114,6 +116,17 @@ static uint32_t dc_overlay_plane_formats[] = {
 	DRM_FORMAT_YUV422,
 };
 
+static const uint64_t plane_modifiers[] = {
+	DRM_FORMAT_MOD_LINEAR,
+	DRM_FORMAT_MOD_NVIDIA_16BX2_BLOCK(0),
+	DRM_FORMAT_MOD_NVIDIA_16BX2_BLOCK(1),
+	DRM_FORMAT_MOD_NVIDIA_16BX2_BLOCK(2),
+	DRM_FORMAT_MOD_NVIDIA_16BX2_BLOCK(3),
+	DRM_FORMAT_MOD_NVIDIA_16BX2_BLOCK(4),
+	DRM_FORMAT_MOD_NVIDIA_16BX2_BLOCK(5),
+	DRM_FORMAT_MOD_INVALID
+};
+
 
 /* Complete description of one window (plane) */
 struct dc_window {
@@ -146,6 +159,18 @@ struct dc_window {
 	/* Color planes base addresses and strides */
 	bus_size_t		base[3];
 	uint32_t		stride[3];	/* stride[2] isn't used by HW */
+};
+
+struct tegra_dc_state {
+	struct drm_crtc_state	drm_state;
+	clk_t			*clk;
+	uint64_t		pclk;
+	uint64_t		div;
+	uint32_t		planes_mask;
+};
+
+struct dc_plane_state {
+	struct drm_plane_state drm_plane_state;
 };
 
 struct dc_softc {
@@ -533,6 +558,31 @@ printf("%s: Enter\n", __func__);
  *    Plane functions.
  *
  */
+static int
+tegra_plane_state_add(struct tegra_plane *plane,
+			  struct drm_plane_state *drm_plane_state)
+{
+printf("%s: Enter\n", __func__);
+	struct drm_crtc_state *crtc_state;
+	struct tegra_dc_state *state;
+	int rv;
+
+	crtc_state = drm_atomic_get_crtc_state(drm_plane_state->state,
+	    drm_plane_state->crtc);
+	if (IS_ERR(crtc_state))
+		return (PTR_ERR(crtc_state));
+
+	/* Check plane state for visibility and calculate clipping bounds */
+	rv = drm_atomic_helper_check_plane_state(drm_plane_state, crtc_state,
+	    0, INT_MAX, true, true);
+	if (rv < 0)
+		return (rv);
+
+	state = container_of(crtc_state, struct tegra_dc_state, drm_state);
+	state->planes_mask |= 1 << plane->index;
+
+	return (0);
+}
 
 static void
 dc_plane_destroy(struct drm_plane *drm_plane)
@@ -545,12 +595,90 @@ printf("%s: Enter\n", __func__);
 	free(plane, DRM_MEM_KMS);
 }
 
+static void
+dc_plane_reset(struct drm_plane *drm_plane)
+{
+printf("%s: Enter\n", __func__);
+	struct tegra_plane *plane;
+	struct dc_plane_state *state;
+
+	plane = container_of(drm_plane, struct tegra_plane, drm_plane);
+	if (drm_plane->state) {
+		__drm_atomic_helper_plane_destroy_state(drm_plane->state);
+		free(plane, DRM_MEM_KMS);
+	}
+
+	state = malloc(sizeof(*state), DRM_MEM_KMS,M_WAITOK | M_ZERO);
+	drm_plane->state = &state->drm_plane_state;
+	drm_plane->state->plane = drm_plane;
+	drm_plane->state->zpos = plane->index;
+	drm_plane->state->normalized_zpos = plane->index;
+}
+
+static struct drm_plane_state *
+dc_plane_atomic_duplicate_state(struct drm_plane *drm_plane)
+{
+printf("%s: Enter\n", __func__);
+	struct dc_plane_state *dst;
+	struct dc_plane_state *state;
+
+	dst = malloc(sizeof(*state), DRM_MEM_KMS,M_WAITOK | M_ZERO);
+
+	__drm_atomic_helper_plane_duplicate_state(drm_plane,
+	    &dst->drm_plane_state);
+
+	/* XXXX TODO copy local fields */
+	return (&dst->drm_plane_state);
+}
+
+static bool
+dc_plane_format_mod_supported(struct drm_plane *plane,
+	uint32_t format, uint64_t modifier)
+{
+printf("%s: Enter\n", __func__);
+	/*
+	 * XXXXX drm_format_info() have wrong signature:
+	 *   const struct drm_format_info *drm_format_info()
+	 * instead of
+	 *   struct drm_format_info * const drm_format_info()
+	 */
+	const struct drm_format_info *info = drm_format_info(format);
+
+	if (modifier == DRM_FORMAT_MOD_LINEAR)
+		return true;
+	if (info->num_planes == 1)
+		return true;
+
+printf("%s: Leave false\n", __func__);
+	return false;
+}
+
+
+static void
+dc_plane_atomic_destroy_state(struct drm_plane *drm_plane,
+    struct drm_plane_state *drm_plane_state)
+{
+	struct dc_plane_state *state;
+
+	state = container_of(drm_plane_state, struct dc_plane_state,
+	    drm_plane_state);
+	__drm_atomic_helper_plane_destroy_state(drm_plane_state);
+	kfree(state);
+}
+
+const struct drm_plane_funcs dc_plane_funcs = {
+	.update_plane = drm_atomic_helper_update_plane,
+	.disable_plane = drm_atomic_helper_disable_plane,
+	.destroy = dc_plane_destroy,
+	.reset = dc_plane_reset,
+	.atomic_duplicate_state = dc_plane_atomic_duplicate_state,
+	.atomic_destroy_state = dc_plane_atomic_destroy_state,
+	.format_mod_supported = dc_plane_format_mod_supported,
+};
+
 static int
-dc_primary_plane_update(struct drm_plane *drm_plane, struct drm_crtc *drm_crtc,
-    struct drm_framebuffer *drm_fb,
-    int crtc_x, int crtc_y, unsigned int crtc_w, unsigned int crtc_h,
-    uint32_t src_x, uint32_t src_y, uint32_t src_w, uint32_t src_h,
-    struct drm_modeset_acquire_ctx *ctx)
+dc_plane_atomic_check(struct drm_plane *drm_plane,
+    struct drm_plane_state *drm_plane_state)
 {
 printf("%s: Enter\n", __func__);
 	struct tegra_plane *plane;
@@ -560,21 +688,24 @@ printf("%s: Enter\n", __func__);
 	struct dc_window win;
 	int rv;
 
+	if (drm_plane_state->crtc == NULL)
+		return (0);
+
 	plane = container_of(drm_plane, struct tegra_plane, drm_plane);
-	fb = container_of(drm_fb, struct tegra_fb, drm_fb);
-	crtc = container_of(drm_crtc, struct tegra_crtc, drm_crtc);
+	fb = container_of(drm_plane_state->fb, struct tegra_fb, drm_fb);
+	crtc = container_of(drm_plane_state->crtc, struct tegra_crtc, drm_crtc);
 	sc = device_get_softc(crtc->dev);
 
 	memset(&win, 0, sizeof(win));
-	win.src_x = src_x >> 16;
-	win.src_y = src_y >> 16;
-	win.src_w = src_w >> 16;
-	win.src_h = src_h >> 16;
-	win.dst_x = crtc_x;
-	win.dst_y = crtc_y;
-	win.dst_w = crtc_w;
-	win.dst_h = crtc_h;
-
+	win.src_x = drm_plane->state->src.x1 >> 16;
+	win.src_y = drm_plane->state->src.y1 >> 16;
+	win.src_w = drm_rect_width(&drm_plane->state->src) >> 16;
+	win.src_h = drm_rect_height(&drm_plane->state->src) >> 16;
+	win.dst_x = drm_plane->state->dst.x1;
+	win.dst_y = drm_plane->state->dst.y1;
+	win.dst_w = drm_rect_width(&drm_plane->state->dst);
+	win.dst_h = drm_rect_height(&drm_plane->state->dst);
+printf("%s: fb: %p(%p), win: %p, idx: %d\n", __func__, fb, drm_plane_state->fb, &win, plane->index);
 	rv = dc_parse_drm_format(fb, &win);
 	if (rv != 0) {
 		DRM_WARN("unsupported pixel format %d\n",
@@ -582,17 +713,17 @@ printf("%s: Enter\n", __func__);
 		return (rv);
 	}
 
-	dc_setup_window(sc, plane->index, &win);
-
-	WR4(sc, DC_CMD_STATE_CONTROL, WIN_A_UPDATE << plane->index);
-	WR4(sc, DC_CMD_STATE_CONTROL, WIN_A_ACT_REQ << plane->index);
+	rv = tegra_plane_state_add(plane, drm_plane_state);
+	if (rv != 0)
+		return (rv);
+printf("%s: leave\n", __func__);
 
 	return (0);
 }
 
-static int
-dc_primary_plane_disable(struct drm_plane *drm_plane,
-    struct drm_modeset_acquire_ctx *ctx)
+static void
+dc_plane_atomic_disable(struct drm_plane *drm_plane,
+    struct drm_plane_state *old_state)
 {
 printf("%s: Enter\n", __func__);
 	struct tegra_plane *plane;
@@ -600,10 +731,11 @@ printf("%s: Enter\n", __func__);
 	struct dc_softc *sc;
 	uint32_t val, idx;
 
-	if (drm_plane->crtc == NULL)
-		return (0);
+	if (old_state == NULL || old_state->crtc == NULL)
+		return;
+
 	plane = container_of(drm_plane, struct tegra_plane, drm_plane);
-	crtc = container_of(drm_plane->crtc, struct tegra_crtc, drm_crtc);
+	crtc = container_of(old_state->crtc, struct tegra_crtc, drm_crtc);
 
 	sc = device_get_softc(crtc->dev);
 	idx = plane->index;
@@ -617,47 +749,155 @@ printf("%s: Enter\n", __func__);
 	WR4(sc, DC_WINC_WIN_OPTIONS, val);
 
 	UNLOCK(sc);
-
-	WR4(sc, DC_CMD_STATE_CONTROL, WIN_A_UPDATE << idx);
-	WR4(sc, DC_CMD_STATE_CONTROL, WIN_A_ACT_REQ << idx);
-
-	return (0);
 }
 
+static void
+dc_plane_atomic_update(struct drm_plane *drm_plane,
+    struct drm_plane_state *old_state)
+{
+printf("%s: Enter\n", __func__);
+	struct tegra_plane *plane;
+	struct tegra_crtc *crtc;
+	struct tegra_fb *fb;
+	struct dc_softc *sc;
+	struct dc_window win;
+	int rv;
 
-static const struct drm_plane_funcs dc_primary_plane_funcs = {
-	.update_plane = dc_primary_plane_update,
-	.disable_plane = dc_primary_plane_disable,
-	.destroy = dc_plane_destroy,
+	if (drm_plane->state->crtc == NULL || drm_plane->state->fb == NULL)
+		return;
+
+	if (!drm_plane->state->visible) {
+		dc_plane_atomic_disable(drm_plane, old_state);
+		return;
+	}
+
+	plane = container_of(drm_plane, struct tegra_plane, drm_plane);
+	fb = container_of(drm_plane->state->fb, struct tegra_fb, drm_fb);
+	crtc = container_of(drm_plane->state->crtc,
+	    struct tegra_crtc, drm_crtc);
+	sc = device_get_softc(crtc->dev);
+
+	memset(&win, 0, sizeof(win));
+	win.src_x = drm_plane->state->src.x1 >> 16;
+	win.src_y = drm_plane->state->src.y1 >> 16;
+	win.src_w = drm_rect_width(&drm_plane->state->src) >> 16;
+	win.src_h = drm_rect_height(&drm_plane->state->src) >> 16;
+	win.dst_x = drm_plane->state->dst.x1;
+	win.dst_y = drm_plane->state->dst.y1;
+	win.dst_w = drm_rect_width(&drm_plane->state->dst);
+	win.dst_h = drm_rect_height(&drm_plane->state->dst);
+	rv = dc_parse_drm_format(fb, &win);
+	if (rv != 0) {
+		DRM_WARN("unsupported pixel format %d\n",
+		    fb->drm_fb.format->format);
+	}
+
+printf("%s: 4 index: %d\n", __func__, plane->index);
+	dc_setup_window(sc, plane->index, &win);
+}
+
+static const struct drm_plane_helper_funcs dc_plane_helper_funcs = {
+	.atomic_check = dc_plane_atomic_check,
+	.atomic_disable = dc_plane_atomic_disable,
+	.atomic_update = dc_plane_atomic_update,
 };
 
 static int
 dc_primary_plane_create(struct dc_softc *sc, struct tegra_drm *drm,
     struct drm_plane **out_plane)
 {
+printf("%s: Enter\n", __func__);
 	int rv;
 	struct tegra_plane *plane;
 
 	plane = malloc(sizeof(*plane), DRM_MEM_KMS, M_WAITOK | M_ZERO);
 	plane->index = 0;
 	rv = drm_universal_plane_init(&drm->drm_dev, &plane->drm_plane,
-	    1 << sc->tegra_crtc.nvidia_head, &dc_primary_plane_funcs,
+	    1 << sc->tegra_crtc.nvidia_head, &dc_plane_funcs,
 	    dc_primary_plane_formats, nitems(dc_primary_plane_formats),
-	    NULL, DRM_PLANE_TYPE_PRIMARY, NULL);
+	    plane_modifiers, DRM_PLANE_TYPE_PRIMARY, NULL);
 	if (rv != 0) {
 		free(plane, DRM_MEM_KMS);
 		return (rv);
 	}
+
+	drm_plane_helper_add(&plane->drm_plane, &dc_plane_helper_funcs);
+	drm_plane_create_zpos_property(&plane->drm_plane, plane->index, 0, 255);
+
+	rv = drm_plane_create_rotation_property(&plane->drm_plane,
+	    DRM_MODE_ROTATE_0, DRM_MODE_ROTATE_0 | DRM_MODE_REFLECT_Y);
+
 	*out_plane = &plane->drm_plane;
 	return (0);
 }
 
+
 static int
-dc_cursor_plane_update(struct drm_plane *drm_plane, struct drm_crtc *drm_crtc,
-    struct drm_framebuffer *drm_fb,
-    int crtc_x, int crtc_y, unsigned int crtc_w, unsigned int crtc_h,
-    uint32_t src_x, uint32_t src_y, uint32_t src_w, uint32_t src_h,
-    struct drm_modeset_acquire_ctx *ctx)
+dc_overlay_plane_create(struct dc_softc *sc, struct tegra_drm *drm, int idx)
+{
+printf("%s: Enter\n", __func__);
+	int rv;
+	struct tegra_plane *plane;
+
+	plane = malloc(sizeof(*plane), DRM_MEM_KMS, M_WAITOK | M_ZERO);
+	plane->index = idx;
+	rv = drm_universal_plane_init(&drm->drm_dev, &plane->drm_plane,
+	    1 << sc->tegra_crtc.nvidia_head, &dc_plane_funcs,
+	    dc_overlay_plane_formats, nitems(dc_overlay_plane_formats),
+	    NULL, DRM_PLANE_TYPE_OVERLAY, NULL);
+	if (rv != 0) {
+		free(plane, DRM_MEM_KMS);
+		return (rv);
+	}
+	drm_plane_helper_add(&plane->drm_plane, &dc_plane_helper_funcs);
+	drm_plane_create_zpos_property(&plane->drm_plane, plane->index, 0, 255);
+
+	rv = drm_plane_create_rotation_property(&plane->drm_plane,
+	    DRM_MODE_ROTATE_0, DRM_MODE_ROTATE_0 | DRM_MODE_REFLECT_Y);
+
+	return (0);
+}
+
+static int
+dc_cursor_atomic_check(struct drm_plane *drm_plane,
+    struct drm_plane_state *drm_plane_state)
+{
+printf("%s: Enter\n", __func__);
+	struct tegra_plane *plane;
+	int rv;
+
+	if (drm_plane_state->crtc == NULL)
+		return (0);
+
+	plane = container_of(drm_plane, struct tegra_plane, drm_plane);
+
+	if (drm_plane_state->src_w != drm_plane_state->src_h)
+		return (-EINVAL);
+	if ((drm_plane_state->src_w >> 16 != drm_plane_state->crtc_w) ||
+	    (drm_plane_state->src_h >> 16 != drm_plane_state->crtc_h))
+		return (-EINVAL);
+
+
+	switch (drm_plane_state->crtc_w) {
+	case 32:
+	case 64:
+	case 128:
+	case 256:
+		break;
+	default:
+		return (-EINVAL);
+	}
+
+	rv = tegra_plane_state_add(plane, drm_plane_state);
+	if (rv != 0)
+		return (rv);
+
+	return (0);
+}
+
+static void
+dc_cursor_atomic_update(struct drm_plane *drm_plane,
+    struct drm_plane_state *old_state)
 {
 printf("%s: Enter\n", __func__);
 	struct tegra_plane *plane;
@@ -667,20 +907,18 @@ printf("%s: Enter\n", __func__);
 	struct tegra_bo *bo;
 	uint32_t val;
 
+	if (drm_plane->state->crtc == NULL || drm_plane->state->fb == NULL)
+		return;
+
 	plane = container_of(drm_plane, struct tegra_plane, drm_plane);
-	fb = container_of(drm_fb, struct tegra_fb, drm_fb);
-	crtc = container_of(drm_crtc, struct tegra_crtc, drm_crtc);
+	crtc = container_of(drm_plane->state->crtc, struct tegra_crtc, drm_crtc);
+	fb = container_of(drm_plane->state->fb, struct tegra_fb, drm_fb);
 	sc = device_get_softc(crtc->dev);
 
 	bo = tegra_fb_get_plane(fb, 0);
 
-	if ((src_w >> 16 != crtc_w) || (src_h >> 16 != crtc_h))
-		return (-EINVAL);
 
-	if (crtc_w != crtc_h)
-		return (-EINVAL);
-
-	switch (crtc_w) {
+	switch (drm_plane->state->crtc_w) {
 	case 32:
 		val = CURSOR_SIZE(C32x32);
 		break;
@@ -694,10 +932,8 @@ printf("%s: Enter\n", __func__);
 		val = CURSOR_SIZE(C256x256);
 		break;
 	default:
-		return (-EINVAL);
+		panic("Invalid cursor size");;
 	}
-
-	bo = NULL;
 
 	val |= CURSOR_CLIP(CC_DISPLAY);
 	val |= CURSOR_START_ADDR(bo->pbase);
@@ -716,17 +952,16 @@ printf("%s: Enter\n", __func__);
 	val |= CURSOR_ENABLE;
 	WR4(sc, DC_DISP_DISP_WIN_OPTIONS, val);
 
+   	WR4(sc, DC_DISP_CURSOR_POSITION,
+   	    CURSOR_POSITION(drm_plane->state->crtc_x, drm_plane->state->crtc_y));
+
 	/* XXX This fixes cursor underflow issues, but why ?  */
 	WR4(sc, DC_DISP_CURSOR_UNDERFLOW_CTRL, CURSOR_UFLOW_CYA);
-
-	WR4(sc, DC_CMD_STATE_CONTROL, GENERAL_UPDATE | CURSOR_UPDATE );
-	WR4(sc, DC_CMD_STATE_CONTROL, GENERAL_ACT_REQ | CURSOR_ACT_REQ);
-	return (0);
 }
 
-static int
-dc_cursor_plane_disable(struct drm_plane *drm_plane,
-    struct drm_modeset_acquire_ctx *ctx)
+static void
+dc_cursor_atomic_disable(struct drm_plane *drm_plane,
+    struct drm_plane_state *old_state)
 {
 printf("%s: Enter\n", __func__);
 	struct tegra_plane *plane;
@@ -734,10 +969,11 @@ printf("%s: Enter\n", __func__);
 	struct dc_softc *sc;
 	uint32_t val;
 
-	if (drm_plane->crtc == NULL)
-		return (0);
+	if (old_state == NULL || old_state->crtc == NULL)
+		return;
+
 	plane = container_of(drm_plane, struct tegra_plane, drm_plane);
-	crtc = container_of(drm_plane->crtc, struct tegra_crtc, drm_crtc);
+	crtc = container_of(old_state->crtc, struct tegra_crtc, drm_crtc);
 
 	sc = device_get_softc(crtc->dev);
 
@@ -745,158 +981,40 @@ printf("%s: Enter\n", __func__);
 	val = RD4(sc, DC_DISP_DISP_WIN_OPTIONS);
 	val &= ~CURSOR_ENABLE;
 	WR4(sc, DC_DISP_DISP_WIN_OPTIONS, val);
-
-	WR4(sc, DC_CMD_STATE_CONTROL, GENERAL_UPDATE | CURSOR_UPDATE );
-	WR4(sc, DC_CMD_STATE_CONTROL, GENERAL_ACT_REQ | CURSOR_ACT_REQ);
 	UNLOCK(sc);
-
-	return (0);
 }
 
-
-static const struct drm_plane_funcs dc_cursor_plane_funcs = {
-	.update_plane = dc_cursor_plane_update,
-	.disable_plane = dc_cursor_plane_disable,
-	.destroy = dc_plane_destroy,
+static const struct drm_plane_helper_funcs dc_cursor_plane_helper_funcs = {
+	.atomic_check = dc_cursor_atomic_check,
+	.atomic_update = dc_cursor_atomic_update,
+	.atomic_disable = dc_cursor_atomic_disable,
 };
+
 
 static int
 dc_cursor_plane_create(struct dc_softc *sc, struct tegra_drm *drm,
     struct drm_plane **out_plane)
 {
+printf("%s: Enter\n", __func__);
 	int rv;
 	struct tegra_plane *plane;
 
 	plane = malloc(sizeof(*plane), DRM_MEM_KMS, M_WAITOK | M_ZERO);
-	plane->index = 0;
+	plane->index = 6; 	/* for WINDOW_ENABLE index */
 	rv = drm_universal_plane_init(&drm->drm_dev, &plane->drm_plane,
-	    1 << sc->tegra_crtc.nvidia_head, &dc_cursor_plane_funcs,
+	    1 << sc->tegra_crtc.nvidia_head, &dc_plane_funcs,
 	    dc_cursor_plane_formats, nitems(dc_cursor_plane_formats),
 	    NULL,  DRM_PLANE_TYPE_CURSOR, NULL);
 	if (rv != 0) {
 		free(plane, DRM_MEM_KMS);
 		return (rv);
 	}
+
+	drm_plane_helper_add(&plane->drm_plane, &dc_cursor_plane_helper_funcs);
 	*out_plane = &plane->drm_plane;
 	return (0);
 }
 
-static int
-dc_overlay_plane_update(struct drm_plane *drm_plane, struct drm_crtc *drm_crtc,
-    struct drm_framebuffer *drm_fb,
-    int crtc_x, int crtc_y, unsigned int crtc_w, unsigned int crtc_h,
-    uint32_t src_x, uint32_t src_y, uint32_t src_w, uint32_t src_h,
-    struct drm_modeset_acquire_ctx *ctx)
-{
-printf("%s: Enter\n", __func__);
-	struct tegra_plane *plane;
-	struct tegra_crtc *crtc;
-	struct tegra_fb *fb;
-	struct dc_softc *sc;
-	struct dc_window win;
-	int rv;
-
-	plane = container_of(drm_plane, struct tegra_plane, drm_plane);
-	fb = container_of(drm_fb, struct tegra_fb, drm_fb);
-	crtc = container_of(drm_crtc, struct tegra_crtc, drm_crtc);
-	sc = device_get_softc(crtc->dev);
-
-	memset(&win, 0, sizeof(win));
-	win.src_x = src_x >> 16;
-	win.src_y = src_y >> 16;
-	win.src_w = src_w >> 16;
-	win.src_h = src_h >> 16;
-	win.dst_x = crtc_x;
-	win.dst_y = crtc_y;
-	win.dst_w = crtc_w;
-	win.dst_h = crtc_h;
-
-	rv = dc_parse_drm_format(fb, &win);
-	if (rv != 0) {
-		DRM_WARN("unsupported pixel format %d\n",
-		    fb->drm_fb.format->format);
-		return (rv);
-	}
-
-	dc_setup_window(sc, plane->index, &win);
-
-	WR4(sc, DC_CMD_STATE_CONTROL, WIN_A_UPDATE << plane->index);
-	WR4(sc, DC_CMD_STATE_CONTROL, WIN_A_ACT_REQ << plane->index);
-
-	return (0);
-}
-
-static int
-dc_overlay_plane_disable(struct drm_plane *drm_plane,
-    struct drm_modeset_acquire_ctx *ctx)
-{
-printf("%s: Enter\n", __func__);
-	struct tegra_plane *plane;
-	struct tegra_crtc *crtc;
-	struct dc_softc *sc;
-	uint32_t val, idx;
-
-	if (drm_plane->crtc == NULL)
-		return (0);
-	plane = container_of(drm_plane, struct tegra_plane, drm_plane);
-	crtc = container_of(drm_plane->crtc, struct tegra_crtc, drm_crtc);
-
-	sc = device_get_softc(crtc->dev);
-	idx = plane->index;
-
-	LOCK(sc);
-
-	WR4(sc, DC_CMD_DISPLAY_WINDOW_HEADER, WINDOW_A_SELECT << idx);
-
-	val = RD4(sc, DC_WINC_WIN_OPTIONS);
-	val &= ~WIN_ENABLE;
-	WR4(sc, DC_WINC_WIN_OPTIONS, val);
-
-	UNLOCK(sc);
-
-	WR4(sc, DC_CMD_STATE_CONTROL, WIN_A_UPDATE << idx);
-	WR4(sc, DC_CMD_STATE_CONTROL, WIN_A_ACT_REQ << idx);
-
-	return (0);
-}
-
-static void
-dc_overlay_plane_destroy(struct drm_plane *drm_plane)
-{
-printf("%s: Enter\n", __func__);
-	struct tegra_plane *plane;
-
-	plane = container_of(drm_plane, struct tegra_plane, drm_plane);
-	dc_overlay_plane_disable(drm_plane, NULL);
-	drm_plane_cleanup(drm_plane);
-	free(plane, DRM_MEM_KMS);
-}
-
-
-static const struct drm_plane_funcs dc_overlay_plane_funcs = {
-	.update_plane = dc_overlay_plane_update,
-	.disable_plane = dc_overlay_plane_disable,
-	.destroy = dc_overlay_plane_destroy,
-};
-
-static int
-dc_overlay_plane_create(struct dc_softc *sc, struct tegra_drm *drm, int idx)
-{
-	int rv;
-	struct tegra_plane *plane;
-
-	plane = malloc(sizeof(*plane), DRM_MEM_KMS, M_WAITOK | M_ZERO);
-	plane->index = idx;
-	rv = drm_universal_plane_init(&drm->drm_dev, &plane->drm_plane,
-	    1 << sc->tegra_crtc.nvidia_head, &dc_overlay_plane_funcs,
-	    dc_overlay_plane_formats, nitems(dc_overlay_plane_formats),
-	    NULL, DRM_PLANE_TYPE_OVERLAY, NULL);
-	if (rv != 0) {
-		free(plane, DRM_MEM_KMS);
-		return (rv);
-	}
-	return (0);
-}
 
 
 /* -------------------------------------------------------------------
@@ -904,59 +1022,13 @@ dc_overlay_plane_create(struct dc_softc *sc, struct tegra_drm *drm, int idx)
  *    CRTC helper functions.
  *
  */
-static void
-dc_crtc_dpms(struct drm_crtc *crtc, int mode)
-{
-	/* Empty function */
-}
-
-static bool
-dc_crtc_mode_fixup(struct drm_crtc *crtc, const struct drm_display_mode *mode,
-    struct drm_display_mode *adjusted)
-{
-printf("%s: Enter\n", __func__);
-
-	return (true);
-}
-
 static int
-dc_set_base(struct dc_softc *sc, int x, int y, struct tegra_fb *fb)
-{
-printf("%s: Enter\n", __func__);
-	struct dc_window win;
-	int rv;
-
-	memset(&win, 0, sizeof(win));
-	win.src_x = x;
-	win.src_y = y;
-	win.src_w = fb->drm_fb.width;
-	win.src_h = fb->drm_fb.height;
-	win.dst_x = x;
-	win.dst_y = y;
-	win.dst_w = fb->drm_fb.width;
-	win.dst_h = fb->drm_fb.height;
-
-	rv = dc_parse_drm_format(fb, &win);
-	if (rv != 0) {
-		DRM_WARN("unsupported pixel format %d\n",
-		    fb->drm_fb.format->format);
-		return (rv);
-	}
-	dc_setup_window(sc, 0, &win);
-
-	return (0);
-}
-
-static int
-dc_crtc_mode_set(struct drm_crtc *drm_crtc, struct drm_display_mode *mode,
-    struct drm_display_mode *adjusted, int x, int y,
-    struct drm_framebuffer *old_fb)
+dc_crtc_mode_set(struct drm_crtc *drm_crtc, struct drm_display_mode *mode)
 {
 printf("%s: Enter\n", __func__);
 	struct dc_softc *sc;
 	struct tegra_crtc *crtc;
 	struct tegra_fb *fb;
-	struct dc_window win;
 	uint32_t div, h_ref_to_sync, v_ref_to_sync;
 	int rv;
 
@@ -964,10 +1036,10 @@ printf("%s: Enter\n", __func__);
 	sc = device_get_softc(crtc->dev);
 	fb = container_of(drm_crtc->primary->fb, struct tegra_fb, drm_fb);
 
-
 	h_ref_to_sync = 1;
 	v_ref_to_sync = 1;
-	/* Setup timing */
+
+	/* Setup clocks */
 	rv = dc_setup_clk(sc, drm_crtc, mode, &div);
 	if (rv != 0) {
 		device_printf(sc->dev, "Cannot set pixel clock\n");
@@ -1001,51 +1073,9 @@ printf("%s: Enter\n", __func__);
 	WR4(sc,DC_DISP_DISP_CLOCK_CONTROL,
 	    SHIFT_CLK_DIVIDER(div) | PIXEL_CLK_DIVIDER(PCD1));
 
-	memset(&win, 0, sizeof(win));
-	win.src_x = x;
-	win.src_y = y;
-	win.src_w = mode->hdisplay;
-	win.src_h = mode->vdisplay;
-	win.dst_x = x;
-	win.dst_y = y;
-	win.dst_w = mode->hdisplay;
-	win.dst_h = mode->vdisplay;
-
-	rv = dc_parse_drm_format(fb, &win);
-	if (rv != 0) {
-		DRM_WARN("unsupported pixel format %d\n",
-		    drm_crtc->primary->fb->format->format);
-		return (rv);
-	}
-
-	dc_setup_window(sc, 0, &win);
-
 	return (0);
 
 }
-
-static int
-dc_crtc_mode_set_base(struct drm_crtc *drm_crtc, int x, int y,
-    struct drm_framebuffer *old_fb)
-{
-printf("%s: Enter\n", __func__);
-	struct dc_softc *sc;
-	struct tegra_crtc *crtc;
-	struct tegra_fb *fb;
-	int rv;
-
-	crtc = container_of(drm_crtc, struct tegra_crtc, drm_crtc);
-	fb = container_of(drm_crtc->primary->fb, struct tegra_fb, drm_fb);
-	sc = device_get_softc(crtc->dev);
-
-	rv = dc_set_base(sc, x, y, fb);
-
-	/* Commit */
-	WR4(sc, DC_CMD_STATE_CONTROL, GENERAL_UPDATE | WIN_A_UPDATE);
-	WR4(sc, DC_CMD_STATE_CONTROL, GENERAL_ACT_REQ | WIN_A_ACT_REQ);
-	return (rv);
-}
-
 
 static void
 dc_crtc_prepare(struct drm_crtc *drm_crtc)
@@ -1081,17 +1111,43 @@ printf("%s: Enter\n", __func__);
 }
 
 static void
-dc_crtc_commit(struct drm_crtc *drm_crtc)
+dc_atomic_begin(struct drm_crtc *drm_crtc,
+    struct drm_crtc_state *old_crtc_state)
+{
+printf("%s: Enter\n", __func__);
+	uint32_t irqflags;
+
+	if (drm_crtc->state->event == NULL)
+		return;
+
+	spin_lock_irqsave(&drm_crtc->dev->event_lock, irqflags);
+
+	if (drm_crtc_vblank_get(drm_crtc) != 0)
+		drm_crtc_send_vblank_event(drm_crtc, drm_crtc->state->event);
+	else
+		drm_crtc_arm_vblank_event(drm_crtc, drm_crtc->state->event);
+
+	drm_crtc->state->event = NULL;
+	spin_unlock_irqrestore(&drm_crtc->dev->event_lock, irqflags);
+}
+
+static void
+dc_atomic_flush(struct drm_crtc *drm_crtc,
+    struct drm_crtc_state *old_crtc_state)
 {
 printf("%s: Enter\n", __func__);
 	struct dc_softc *sc;
 	struct tegra_crtc *crtc;
+	struct tegra_dc_state *state;
 	uint32_t val;
 
 	crtc = container_of(drm_crtc, struct tegra_crtc, drm_crtc);
+	state = container_of(drm_crtc->state, struct tegra_dc_state, drm_state);
 	sc = device_get_softc(crtc->dev);
 
-	WR4(sc, DC_CMD_STATE_CONTROL, GENERAL_UPDATE | WIN_A_UPDATE);
+printf("%s: Planes mask: 0x%08X\n", __func__, state->planes_mask);
+	val = GENERAL_UPDATE | state->planes_mask << 9;
+	WR4(sc, DC_CMD_STATE_CONTROL, val);
 
 	val = RD4(sc, DC_CMD_INT_MASK);
 	val |= FRAME_END_INT;
@@ -1101,32 +1157,181 @@ printf("%s: Enter\n", __func__);
 	val |= FRAME_END_INT;
 	WR4(sc, DC_CMD_INT_ENABLE, val);
 
-	WR4(sc, DC_CMD_STATE_CONTROL,  GENERAL_ACT_REQ | WIN_A_ACT_REQ);
+	val = GENERAL_ACT_REQ | state->planes_mask << 1;
+	WR4(sc, DC_CMD_STATE_CONTROL, val);
+}
+
+static void
+dc_atomic_enable(struct drm_crtc *drm_crtc, struct drm_crtc_state *old_state)
+{
+printf("%s: Enter\n", __func__);
+	struct dc_softc *sc;
+	struct tegra_crtc *crtc;
+	struct drm_display_mode *mode;
+
+	crtc = container_of(drm_crtc, struct tegra_crtc, drm_crtc);
+	mode = &drm_crtc->state->adjusted_mode;
+	sc = device_get_softc(crtc->dev);
+
+	dc_crtc_prepare(drm_crtc);
+	dc_crtc_mode_set(drm_crtc, mode);
+
+	/* Commit all */
+	WR4(sc, DC_CMD_STATE_CONTROL, GENERAL_UPDATE );
+	WR4(sc, DC_CMD_STATE_CONTROL, GENERAL_ACT_REQ);
+
+	drm_crtc_vblank_on(drm_crtc);
+}
+
+static void
+dc_atomic_disable(struct drm_crtc *drm_crtc, struct drm_crtc_state *old_state)
+{
+printf("%s: Enter\n", __func__);
+	struct dc_softc *sc;
+	struct tegra_crtc *crtc;
+	uint32_t val, irqflags;
+
+	crtc = container_of(drm_crtc, struct tegra_crtc, drm_crtc);
+	sc = device_get_softc(crtc->dev);
+
+	/* XXX TODO: Wait until DC is idle */
+
+	/* Stop display */
+	val = RD4(sc, DC_CMD_DISPLAY_COMMAND);
+	val &= ~DISPLAY_CTRL_MODE(~0);
+	val |= DISPLAY_CTRL_MODE(CTRL_MODE_STOP);
+	WR4(sc, DC_CMD_DISPLAY_COMMAND, val);
+
+	/* Power down display */
+	val = RD4(sc, DC_CMD_DISPLAY_POWER_CONTROL);
+	val &= PW0_ENABLE | PW1_ENABLE | PW2_ENABLE | PW3_ENABLE | PW4_ENABLE |
+	    PM0_ENABLE | PM1_ENABLE;
+	WR4(sc, DC_CMD_DISPLAY_POWER_CONTROL, val);
+
+	drm_crtc_vblank_off(drm_crtc);
+
+	spin_lock_irqsave(&drm_crtc->dev->event_lock, irqflags);
+
+	if (drm_crtc->state->event) {
+		drm_crtc_send_vblank_event(drm_crtc, drm_crtc->state->event);
+		drm_crtc->state->event = NULL;
+	}
+
+	spin_unlock_irqrestore(&drm_crtc->dev->event_lock, irqflags);
+
 }
 
 static const struct drm_crtc_helper_funcs dc_crtc_helper_funcs = {
-	.dpms = dc_crtc_dpms,
-	.mode_fixup = dc_crtc_mode_fixup,
-	.mode_set = dc_crtc_mode_set,
-	.mode_set_base = dc_crtc_mode_set_base,
-	.prepare = dc_crtc_prepare,
-	.commit = dc_crtc_commit,
+	.atomic_begin = dc_atomic_begin,
+	.atomic_flush = dc_atomic_flush,
+	.atomic_enable = dc_atomic_enable,
+	.atomic_disable = dc_atomic_disable,
+
 };
 
 /* -------------------------------------------------------------------
  *
  *   Exported functions (mainly vsync related).
  *
- * XXX revisit this -> convert to bus methods?
  */
-int
-tegra_dc_get_pipe(struct drm_crtc *drm_crtc)
+void
+tegra_dc_cancel_page_flip(struct drm_crtc *drm_crtc, struct drm_file *file)
 {
 printf("%s: Enter\n", __func__);
+	struct dc_softc *sc;
+	struct tegra_crtc *crtc;
+	struct drm_device *drm;
+	unsigned long flags;
+
+	crtc = container_of(drm_crtc, struct tegra_crtc, drm_crtc);
+	sc = device_get_softc(crtc->dev);
+	drm = drm_crtc->dev;
+	spin_lock_irqsave(&drm->event_lock, flags);
+
+	if ((sc->event != NULL) && (sc->event->base.file_priv == file)) {
+//		drm_event_cancel_free(crtc->dev, &e->base);
+//		sc->event->base.destroy(&sc->event->base);
+		drm_crtc_vblank_put(drm_crtc);
+		sc->event = NULL;
+	}
+	spin_unlock_irqrestore(&drm->event_lock, flags);
+}
+
+/* -------------------------------------------------------------------
+ *
+ *    CRTC functions.
+ *
+ */
+
+static void
+dc_destroy(struct drm_crtc *crtc)
+{
+printf("%s: Enter\n", __func__);
+
+	drm_crtc_cleanup(crtc);
+	memset(crtc, 0, sizeof(*crtc));
+}
+
+static void
+dc_reset(struct drm_crtc *drm_crtc)
+{
+printf("%s: Enter\n", __func__);
+	struct tegra_dc_state *state;
+
+	if (drm_crtc->state != NULL) {
+		state = container_of(drm_crtc->state, struct tegra_dc_state,
+		    drm_state);
+		__drm_atomic_helper_crtc_destroy_state(drm_crtc->state);
+		free(state, DRM_MEM_KMS);
+	}
+
+	state =  malloc(sizeof(*state), DRM_MEM_DRIVER, M_WAITOK | M_ZERO);
+	drm_crtc->state = &state->drm_state;
+	drm_crtc->state->crtc = drm_crtc;
+	drm_crtc_vblank_reset(drm_crtc);
+}
+
+static struct drm_crtc_state *
+dc_atomic_duplicate_state(struct drm_crtc *drm_crtc)
+{
+printf("%s: Enter\n", __func__);
+	struct tegra_dc_state *src, *dst;
+
+	src = container_of(drm_crtc->state, struct tegra_dc_state, drm_state);
+
+	dst = malloc(sizeof(*dst), DRM_MEM_DRIVER, M_WAITOK | M_ZERO);
+
+	__drm_atomic_helper_crtc_duplicate_state(drm_crtc, &dst->drm_state);
+
+	dst->clk = src->clk;
+	dst->pclk = src->pclk;
+	dst->div = src->div;
+	dst->planes_mask = src->planes_mask;
+
+	return (&dst->drm_state);
+}
+
+static void
+dc_atomic_destroy_state(struct drm_crtc *drm_crtc,
+    struct drm_crtc_state *drm_state)
+{
+printf("%s: Enter\n", __func__);
+	struct tegra_dc_state *state;
+
+	state = container_of(drm_state, struct tegra_dc_state, drm_state);
+	__drm_atomic_helper_crtc_destroy_state(drm_state);
+	free(state, DRM_MEM_KMS);
+}
+
+static uint32_t
+dc_get_vblank_counter(struct drm_crtc *drm_crtc)
+{
+//printf("%s: Enter\n", __func__);
 	struct tegra_crtc *crtc;
 
 	crtc = container_of(drm_crtc, struct tegra_crtc, drm_crtc);
-	return (crtc->nvidia_head);
+	/* XXXX read counter from syncpt engine */
+	return (drm_crtc_vblank_count(drm_crtc));
 }
 
 static int
@@ -1167,122 +1372,16 @@ printf("%s: Enter\n", __func__);
 	UNLOCK(sc);
 }
 
-static void
-dc_finish_page_flip(struct dc_softc *sc)
-{
-	struct drm_crtc *drm_crtc;
-	struct drm_device *drm;
-	struct tegra_fb *fb;
-	struct tegra_bo *bo;
-	uint32_t base;
-	unsigned long flags;
-
-	drm_crtc = &sc->tegra_crtc.drm_crtc;
-	drm = drm_crtc->dev;
-	fb = container_of(drm_crtc->primary->fb, struct tegra_fb, drm_fb);
-
-	spin_lock_irqsave(&drm->event_lock, flags);
-
-	if (sc->event == NULL) {
-		spin_unlock_irqrestore(&drm->event_lock, flags);
-		return;
-	}
-
-	LOCK(sc);
-	/* Read active copy of WINBUF_START_ADDR */
-	WR4(sc, DC_CMD_DISPLAY_WINDOW_HEADER, WINDOW_A_SELECT);
-	WR4(sc, DC_CMD_STATE_ACCESS, READ_MUX);
-	base = RD4(sc, DC_WINBUF_START_ADDR);
-	WR4(sc, DC_CMD_STATE_ACCESS, 0);
-	UNLOCK(sc);
-
-	/* Is already active */
-	bo = tegra_fb_get_plane(fb, 0);
-	if (base == (bo->pbase + fb->drm_fb.offsets[0])) {
-		drm_crtc_send_vblank_event(drm_crtc, sc->event);
-		drm_crtc_vblank_put(drm_crtc);
-		sc->event = NULL;
-	}
-
-	spin_unlock_irqrestore(&drm->event_lock, flags);
-}
-
-
-void
-tegra_dc_cancel_page_flip(struct drm_crtc *drm_crtc, struct drm_file *file)
-{
-printf("%s: Enter\n", __func__);
-	struct dc_softc *sc;
-	struct tegra_crtc *crtc;
-	struct drm_device *drm;
-	unsigned long flags;
-
-	crtc = container_of(drm_crtc, struct tegra_crtc, drm_crtc);
-	sc = device_get_softc(crtc->dev);
-	drm = drm_crtc->dev;
-	spin_lock_irqsave(&drm->event_lock, flags);
-
-	if ((sc->event != NULL) && (sc->event->base.file_priv == file)) {
-//		drm_event_cancel_free(crtc->dev, &e->base);
-//		sc->event->base.destroy(&sc->event->base);
-		drm_crtc_vblank_put(drm_crtc);
-		sc->event = NULL;
-	}
-	spin_unlock_irqrestore(&drm->event_lock, flags);
-}
-
-/* -------------------------------------------------------------------
- *
- *    CRTC functions.
- *
- */
-static int
-dc_page_flip(struct drm_crtc *drm_crtc, struct drm_framebuffer *drm_fb,
-    struct drm_pending_vblank_event *event, uint32_t flags,
-    struct drm_modeset_acquire_ctx *ctx)
-{
-printf("%s: Enter\n", __func__);
-	struct dc_softc *sc;
-	struct tegra_crtc *crtc;
-	struct tegra_fb *fb;
-	struct drm_device *drm;
-
-	crtc = container_of(drm_crtc, struct tegra_crtc, drm_crtc);
-	sc = device_get_softc(crtc->dev);
-	fb = container_of(drm_crtc->primary->fb, struct tegra_fb, drm_fb);
-	drm = drm_crtc->dev;
-
-	if (sc->event != NULL)
-		return (-EBUSY);
-
-	if (event != NULL) {
-		event->pipe = sc->tegra_crtc.nvidia_head;
-		sc->event = event;
-		drm_crtc_vblank_get(drm_crtc);
-	}
-
-	dc_set_base(sc, drm_crtc->x, drm_crtc->y, fb);
-	drm_crtc->primary->fb = drm_fb;
-
-	/* Commit */
-	WR4(sc, DC_CMD_STATE_CONTROL, GENERAL_UPDATE | WIN_A_UPDATE);
-
-	return (0);
-}
-
-static void
-dc_destroy(struct drm_crtc *crtc)
-{
-printf("%s: Enter\n", __func__);
-
-	drm_crtc_cleanup(crtc);
-	memset(crtc, 0, sizeof(*crtc));
-}
-
 static const struct drm_crtc_funcs dc_crtc_funcs = {
-	.page_flip = dc_page_flip,
-	.set_config = drm_crtc_helper_set_config,
+	.page_flip = drm_atomic_helper_page_flip,
+	.set_config = drm_atomic_helper_set_config,
 	.destroy = dc_destroy,
+	.reset = dc_reset,
+
+	.atomic_duplicate_state = dc_atomic_duplicate_state,
+	.atomic_destroy_state = dc_atomic_destroy_state,
+
+	.get_vblank_counter = dc_get_vblank_counter,
 	.enable_vblank = dc_enable_vblank,
 	.disable_vblank = dc_disable_vblank,
 };
@@ -1362,9 +1461,7 @@ dc_intr(void *arg)
 	status = RD4(sc, DC_CMD_INT_STATUS);
 	WR4(sc, DC_CMD_INT_STATUS, status);
 	if (status & VBLANK_INT) {
-		drm_handle_vblank(sc->tegra_crtc.drm_crtc.dev,
-		    sc->tegra_crtc.nvidia_head);
-		dc_finish_page_flip(sc);
+		drm_crtc_handle_vblank(&sc->tegra_crtc.drm_crtc);
 	}
 }
 

@@ -96,13 +96,10 @@ int tegra_drm_encoder_exit(struct tegra_drm_encoder *output,
 enum drm_connector_status tegra_drm_connector_detect(
     struct drm_connector *connector, bool force);
 int tegra_drm_connector_get_modes(struct drm_connector *connector);
-struct drm_encoder *tegra_drm_connector_best_encoder(
-    struct drm_connector *connector);
 
 /* tegra_dc.c */
 void tegra_dc_cancel_page_flip(struct drm_crtc *drm_crtc,
     struct drm_file *file);
-int tegra_dc_get_pipe(struct drm_crtc *drm_crtc);
 
 /* tegra_fb.c */
 struct fb_info *tegra_drm_fb_getinfo(struct drm_device *drm);

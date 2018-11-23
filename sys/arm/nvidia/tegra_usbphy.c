@@ -311,7 +311,7 @@ static phynode_usb_method_t usbphy_phynode_methods[] = {
 	PHYNODEUSBMETHOD_END
 };
 DEFINE_CLASS_1(usbphy_phynode, usbphy_phynode_class, usbphy_phynode_methods,
-    0, phynode_usb_class);
+    sizeof(struct phynode_usb_sc), phynode_usb_class);
 
 #define	RD4(sc, offs)							\
 	 bus_read_4(sc->mem_res, offs)
